@@ -15,7 +15,7 @@ export default function Home() {
   const [name, setName] = useState('')
   const [avatar, setAvatar] = useState(AVATARS[0])
   const [avatarColor, setAvatarColor] = useState(AVATAR_COLORS[0])
-  const [targetScore, setTargetScore] = useState(50)
+  const [targetScore, setTargetScore] = useState('50')
   const [roomType, setRoomType] = useState('private')
   const [joinCode, setJoinCode] = useState('')
   const [loading, setLoading] = useState(false)
@@ -48,7 +48,7 @@ export default function Home() {
       const playerId = LS.get('npat_pid') || generatePlayerId()
       LS.set('npat_pid', playerId)
 
-      const room = await createRoom({ hostId: playerId, targetScore, roomType })
+      const room = await createRoom({ hostId: playerId, targetScore: Math.min(200, Math.max(10, parseInt(targetScore)||50)), roomType })
       await joinPlayer({
         id: playerId,
         roomId: room.id,
@@ -204,10 +204,18 @@ export default function Home() {
               <div className="input-group" style={{ margin: 0 }}>
                 <label className="input-label">🎯 Play to Points</label>
                 <input
-                  type="number"
+                  type="text"
+                  inputMode="numeric"
                   value={targetScore}
-                  min={10} max={200}
-                  onChange={e => setTargetScore(Math.max(10, parseInt(e.target.value)||50))}
+                  placeholder="50"
+                  onChange={e => {
+                    const raw = e.target.value.replace(/[^0-9]/g, '')
+                    setTargetScore(raw)
+                  }}
+                  onBlur={() => {
+                    const n = parseInt(targetScore) || 50
+                    setTargetScore(String(Math.min(200, Math.max(10, n))))
+                  }}
                 />
               </div>
               <div className="input-group" style={{ margin: 0 }}>

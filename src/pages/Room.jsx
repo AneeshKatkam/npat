@@ -37,9 +37,12 @@ export default function Room() {
   const [processing, setProcessing] = useState(false)
 
   const timerRef = useRef(null)
+  // Keep meRef fresh
+  useEffect(() => { meRef.current = me }, [me])
   const pingRef = useRef(null)
   const channelRef = useRef(null)
   const submittedRef = useRef(false)
+  const meRef = useRef(null)  // always-fresh copy of me
 
   // ─── Load room & players ───────────────────────────────────────────────────
   useEffect(() => {
@@ -100,20 +103,60 @@ export default function Room() {
     if (!supabase) return
     const ch = supabase.channel(`room:${roomId}`, { config: { broadcast: { self: false } } })
 
-    // Room changes
+    // Room changes — this is the primary driver for ALL players
     ch.on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'rooms', filter: `id=eq.${roomId}` },
-      payload => {
+      async payload => {
         const r = payload.new
         setRoom(r)
-        if (r.status === 'playing' && r.round_number) {
+
+        if (r.status === 'playing') {
+          // New round started — reset everything and start timer
           setAnswers({ Name:'', Place:'', Animal:'', Thing:'' })
           setSubmitted(false)
           submittedRef.current = false
           setRoundAnswers([])
           setCurrentResults([])
+          setProcessing(false)
           clearInterval(timerRef.current)
           Audio.roundStart()
           startTimer(ROUND_TIME)
+        }
+
+        if (r.status === 'results' || r.status === 'finished') {
+          // Round is over — ALL players fetch results from DB
+          clearInterval(timerRef.current)
+          try {
+            const [answers, playerList] = await Promise.all([
+              getRoomAnswers(roomId, r.round_number),
+              getPlayers(roomId)
+            ])
+            // Rebuild results from DB data
+            const resultsFromDB = answers.map(a => {
+              const player = playerList.find(p => p.id === a.player_id)
+              return {
+                playerId: a.player_id,
+                playerName: player?.name || 'Unknown',
+                avatar: player?.avatar,
+                avatarColor: player?.avatar_color,
+                answers: { Name: a.name_answer, Place: a.place_answer, Animal: a.animal_answer, Thing: a.thing_answer },
+                valid: { Name: a.name_valid, Place: a.place_valid, Animal: a.animal_valid, Thing: a.thing_valid },
+                points: { Name: a.name_points, Place: a.place_points, Animal: a.animal_points, Thing: a.thing_points },
+                pointReason: {
+                  Name: a.name_points === 1 ? 'unique' : a.name_points === 0.5 ? 'shared' : a.name_valid ? 'repeated' : 'invalid',
+                  Place: a.place_points === 1 ? 'unique' : a.place_points === 0.5 ? 'shared' : a.place_valid ? 'repeated' : 'invalid',
+                  Animal: a.animal_points === 1 ? 'unique' : a.animal_points === 0.5 ? 'shared' : a.animal_valid ? 'repeated' : 'invalid',
+                  Thing: a.thing_points === 1 ? 'unique' : a.thing_points === 0.5 ? 'shared' : a.thing_valid ? 'repeated' : 'invalid',
+                },
+                total: a.total_points,
+              }
+            })
+            setCurrentResults(resultsFromDB)
+            buildScores(playerList)
+            setProcessing(false)
+            if (r.status === 'finished') { spawnConfetti(); Audio.win() }
+          } catch(e) {
+            console.error('Failed to load results', e)
+          }
         }
       }
     )
@@ -129,37 +172,35 @@ export default function Room() {
       }
     )
 
-    // Answer submissions (host tracks these)
+    // Answer submissions — track who submitted for the "waiting" counter
     ch.on('postgres_changes', { event: '*', schema: 'public', table: 'round_answers', filter: `room_id=eq.${roomId}` },
       async () => {
         const r = await getRoom(roomId)
         if (r.status !== 'playing') return
         const ans = await getRoomAnswers(roomId, r.round_number)
         setRoundAnswers(ans)
+
+        // If host: check if everyone submitted, then score immediately (don't wait for timer)
+        if (meRef.current?.is_host && ans.length >= players.length) {
+          clearInterval(timerRef.current)
+          scoreRound(r)
+        }
       }
     )
 
-    // Room events
+    // Room events — only used for join notifications now
     ch.on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'room_events', filter: `room_id=eq.${roomId}` },
-      payload => handleRoomEvent(payload.new)
+      payload => {
+        const { event_type, payload: ep } = payload.new
+        if (event_type === 'player_joined') {
+          toast(`🎮 ${ep.name} joined the game!`, 'var(--accent)')
+          Audio.join()
+        }
+      }
     )
 
     ch.subscribe()
     channelRef.current = ch
-  }
-
-  function handleRoomEvent(event) {
-    const { event_type, payload } = event
-    if (event_type === 'player_joined') {
-      toast(`🎮 ${payload.name} joined the game!`, 'var(--accent)')
-      Audio.join()
-    } else if (event_type === 'round_scored') {
-      setCurrentResults(payload.results || [])
-      setProcessing(false)
-    } else if (event_type === 'game_winner') {
-      spawnConfetti()
-      Audio.win()
-    }
   }
 
   // ─── Timer ────────────────────────────────────────────────────────────────
@@ -187,6 +228,8 @@ export default function Room() {
     clearInterval(timerRef.current)
 
     const r = await getRoom(roomId)
+    if (!r || r.status !== 'playing') return
+
     await submitAnswer({
       roomId,
       playerId,
@@ -195,14 +238,24 @@ export default function Room() {
       answers,
     })
 
-    // If host: wait a moment then score the round
-    if (me?.is_host) {
-      setTimeout(() => scoreRound(r), 3000)
+    // If host: score after a short wait (gives other players time to submit)
+    // The answer-change realtime listener will also trigger scoring if everyone submits early
+    if (meRef.current?.is_host) {
+      setTimeout(async () => {
+        const fresh = await getRoom(roomId)
+        // Only score if still in playing state (not already scored)
+        if (fresh.status === 'playing') {
+          scoreRound(fresh)
+        }
+      }, 4000)
     }
   }
 
   // ─── Score round (host only) ──────────────────────────────────────────────
+  const scoringRef = useRef(false)
   async function scoreRound(r) {
+    if (scoringRef.current) return   // prevent double scoring
+    scoringRef.current = true
     setProcessing(true)
     try {
       // Get all answers
@@ -288,6 +341,7 @@ export default function Room() {
 
     } catch (e) {
       console.error('Score error', e)
+      scoringRef.current = false
       setProcessing(false)
       toast('Error scoring round: ' + e.message, 'var(--danger)')
     }
@@ -310,6 +364,7 @@ export default function Room() {
   // ─── Next round (host) ────────────────────────────────────────────────────
   async function handleNextRound() {
     submittedRef.current = false
+    scoringRef.current = false
     setSubmitted(false)
     setCurrentResults([])
     setRoundAnswers([])
@@ -328,6 +383,7 @@ export default function Room() {
 
   // ─── Play again (host) ───────────────────────────────────────────────────
   async function handlePlayAgain() {
+    scoringRef.current = false
     const pList = await getPlayers(roomId)
     for (const p of pList) await updatePlayerScore(p.id, 0)
     await updateRoom(roomId, {
@@ -398,7 +454,7 @@ export default function Room() {
           onSubmit={handleSubmit}
         />
       )}
-      {(status === 'results' || (status === 'playing' && currentResults.length > 0)) && currentResults.length > 0 && (
+      {(status === 'results' || status === 'finished') && currentResults.length > 0 && (
         <Results
           room={room}
           players={players}
@@ -409,6 +465,15 @@ export default function Room() {
           isHost={me.is_host}
           onNext={handleNextRound}
         />
+      )}
+      {(status === 'results' || status === 'finished') && currentResults.length === 0 && (
+        <div className="card text-center" style={{ padding: '48px 24px' }}>
+          <div style={{ fontSize: '3rem', marginBottom: 16 }}>🤖</div>
+          <div className="font-display" style={{ fontSize: '1.5rem', color: 'var(--primary-light)', marginBottom: 8 }}>
+            Calculating Scores...
+          </div>
+          <p className="text-muted text-sm">Claude AI is validating all answers. Almost done!</p>
+        </div>
       )}
       {status === 'finished' && (
         <Winner
