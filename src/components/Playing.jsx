@@ -3,15 +3,14 @@ import { CATEGORIES, CAT_ICONS, ROUND_TIME } from '../lib/game.js'
 
 export default function Playing({
   room, players, me, answers, setAnswers,
-  timeLeft, submitted, roundAnswers, scores, onSubmit
+  timeLeft, submitted, submittedCount, scores, onSubmit
 }) {
   const pct = (timeLeft / ROUND_TIME * 100).toFixed(1)
   const timerColor = timeLeft <= 10 ? 'var(--danger)' : timeLeft <= 20 ? 'var(--secondary)' : 'var(--accent)'
   const letter = room.current_letter || '?'
 
   const myScore = scores[me.id] || 0
-  const submittedPlayerIds = new Set(roundAnswers.map(a => a.player_id))
-  const submittedCount = submittedPlayerIds.size
+  // submittedCount passed as prop
 
   const sortedPlayers = useMemo(() => {
     return [...players].sort((a, b) => (scores[b.id]||0) - (scores[a.id]||0))
@@ -120,7 +119,7 @@ export default function Playing({
         <div className="section-title">🏆 Scoreboard</div>
         {sortedPlayers.map((p, i) => {
           const sc = scores[p.id] || 0
-          const hasSubmitted = submittedPlayerIds.has(p.id)
+          const hasSubmitted = false // individual status not tracked, use count
           const barPct = Math.min(100, (sc / room.target_score) * 100)
           return (
             <div key={p.id} className={`scoreboard-row rank-${i+1}${p.id===me.id?' is-you':''}`}>

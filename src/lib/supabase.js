@@ -171,9 +171,18 @@ export async function getRoomAnswers(roomId, roundNumber) {
 }
 
 export async function submitAnswer({ roomId, playerId, roundNumber, letter, answers }) {
+  // Delete any existing answer first (re-submit case), then insert fresh
+  // This ensures realtime INSERT fires reliably for all listeners
+  await supabase
+    .from('round_answers')
+    .delete()
+    .eq('room_id', roomId)
+    .eq('player_id', playerId)
+    .eq('round_number', roundNumber)
+
   const { error } = await supabase
     .from('round_answers')
-    .upsert({
+    .insert({
       room_id: roomId,
       player_id: playerId,
       round_number: roundNumber,
@@ -182,7 +191,7 @@ export async function submitAnswer({ roomId, playerId, roundNumber, letter, answ
       place_answer: answers.Place || '',
       animal_answer: answers.Animal || '',
       thing_answer: answers.Thing || '',
-    }, { onConflict: 'room_id,player_id,round_number' })
+    })
   if (error) throw error
 }
 
