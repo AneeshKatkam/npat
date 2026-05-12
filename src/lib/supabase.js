@@ -1,7 +1,5 @@
 import { createClient } from '@supabase/supabase-js'
 
-// These are safe to expose publicly — they are anon/public keys
-// Row Level Security protects your data server-side
 const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL || ''
 const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY || ''
 
@@ -13,8 +11,6 @@ export const supabase = SUPABASE_URL && SUPABASE_ANON_KEY
 
 export const isConfigured = () => !!supabase
 
-// ─── SQL to run in Supabase SQL Editor ───────────────────────────────────────
-// (Shown in Setup screen when not configured)
 export const SETUP_SQL = `
 -- Enable UUID generation
 create extension if not exists "pgcrypto";
@@ -24,8 +20,8 @@ create table if not exists rooms (
   id text primary key default upper(substring(gen_random_uuid()::text, 1, 6)),
   host_id text not null,
   target_score int not null default 50,
-  room_type text not null default 'private', -- private | world
-  status text not null default 'lobby',      -- lobby | playing | finished
+  room_type text not null default 'private',
+  status text not null default 'lobby',
   current_letter text,
   round_number int not null default 0,
   used_letters text[] not null default '{}',
@@ -72,7 +68,7 @@ create table if not exists round_answers (
   submitted_at timestamptz default now()
 );
 
--- Room events (for real-time chat/notifications)
+-- Room events
 create table if not exists room_events (
   id uuid primary key default gen_random_uuid(),
   room_id text references rooms(id) on delete cascade,
@@ -93,25 +89,33 @@ alter publication supabase_realtime add table players;
 alter publication supabase_realtime add table round_answers;
 alter publication supabase_realtime add table room_events;
 
--- CRITICAL: Set REPLICA IDENTITY FULL so UPDATE events broadcast old+new row
--- Without this, only INSERT events work reliably with Supabase Realtime
+-- REQUIRED: Set REPLICA IDENTITY FULL for reliable UPDATE events
+alter table round_answers replica identity full;
+alter table rooms replica identity full;
+alter table players replica identity full;
+
+-- RLS Policies
 alter table rooms enable row level security;
 alter table players enable row level security;
 alter table round_answers enable row level security;
 alter table room_events enable row level security;
 
-alter table round_answers replica identity full;
-alter table rooms replica identity full;
-alter table players replica identity full;
-
--- RLS Policies (allow anonymous access for the game)
 create policy "Public rooms" on rooms for all using (true) with check (true);
 create policy "Public players" on players for all using (true) with check (true);
 create policy "Public answers" on round_answers for all using (true) with check (true);
 create policy "Public events" on room_events for all using (true) with check (true);
 `
 
+export const MIGRATION_SQL = `
+-- Run this if you already have the DB set up (fixes score carryover + timer sync + realtime)
+alter table round_answers replica identity full;
+alter table rooms replica identity full;
+alter table players replica identity full;
+alter table rooms add column if not exists settings jsonb not null default '{}';
+`
+
 // ─── DB helpers ──────────────────────────────────────────────────────────────
+
 export async function createRoom({ hostId, targetScore, roomType }) {
   const { data, error } = await supabase
     .from('rooms')
@@ -140,20 +144,40 @@ export async function updateRoom(roomId, updates) {
   if (error) throw error
 }
 
+// Join or re-join a player. Score is NOT reset here — use resetAllScores for that.
 export async function joinPlayer({ id, roomId, name, avatar, avatarColor, isHost }) {
-  const { error } = await supabase
+  // Check if player already exists in this room
+  const { data: existing } = await supabase
     .from('players')
-    .upsert({
-      id,
-      room_id: roomId,
-      name,
-      avatar,
-      avatar_color: avatarColor,
-      is_host: isHost,
-      is_online: true,
-      last_seen: new Date().toISOString()
-    })
-  if (error) throw error
+    .select('id, score')
+    .eq('id', id)
+    .eq('room_id', roomId)
+    .single()
+
+  if (existing) {
+    // Re-joining: just update online status, keep score
+    const { error } = await supabase
+      .from('players')
+      .update({ is_online: true, last_seen: new Date().toISOString(), name, avatar, avatar_color: avatarColor })
+      .eq('id', id)
+    if (error) throw error
+  } else {
+    // New player: insert with score 0
+    const { error } = await supabase
+      .from('players')
+      .insert({
+        id,
+        room_id: roomId,
+        name,
+        avatar,
+        avatar_color: avatarColor,
+        is_host: isHost,
+        is_online: true,
+        score: 0,
+        last_seen: new Date().toISOString()
+      })
+    if (error) throw error
+  }
 }
 
 export async function getPlayers(roomId) {
@@ -166,6 +190,15 @@ export async function getPlayers(roomId) {
   return data
 }
 
+// Reset ALL player scores to 0 for a new game — called by Play Again
+export async function resetAllScores(roomId) {
+  const { error } = await supabase
+    .from('players')
+    .update({ score: 0 })
+    .eq('room_id', roomId)
+  if (error) throw error
+}
+
 export async function getRoomAnswers(roomId, roundNumber) {
   const { data, error } = await supabase
     .from('round_answers')
@@ -176,9 +209,19 @@ export async function getRoomAnswers(roomId, roundNumber) {
   return data
 }
 
+// Count how many players have submitted for a given round
+export async function getSubmittedCount(roomId, roundNumber) {
+  const { count, error } = await supabase
+    .from('round_answers')
+    .select('id', { count: 'exact', head: true })
+    .eq('room_id', roomId)
+    .eq('round_number', roundNumber)
+  if (error) throw error
+  return count || 0
+}
+
 export async function submitAnswer({ roomId, playerId, roundNumber, letter, answers }) {
-  // Delete any existing answer first (re-submit case), then insert fresh
-  // This ensures realtime INSERT fires reliably for all listeners
+  // Delete then insert so realtime INSERT event always fires
   await supabase
     .from('round_answers')
     .delete()
@@ -218,10 +261,7 @@ export async function updatePlayerScore(playerId, score) {
 }
 
 export async function sendRoomEvent(roomId, eventType, payload = {}) {
-  const { error } = await supabase
-    .from('room_events')
-    .insert({ room_id: roomId, event_type: eventType, payload })
-  if (error) console.error('Event error', error)
+  await supabase.from('room_events').insert({ room_id: roomId, event_type: eventType, payload })
 }
 
 export async function pingPlayer(playerId) {
