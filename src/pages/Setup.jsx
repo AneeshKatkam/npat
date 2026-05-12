@@ -3,18 +3,39 @@ import { useNavigate } from 'react-router-dom'
 import { SETUP_SQL } from '../lib/supabase.js'
 import { copyText, toast } from '../lib/game.js'
 
+const MIGRATION_SQL = `
+-- Run this if you already have the database set up (fixes timer sync + realtime reliability)
+
+-- 1. Add REPLICA IDENTITY FULL (fixes UPDATE realtime events)
+alter table round_answers replica identity full;
+alter table rooms replica identity full;
+alter table players replica identity full;
+
+-- 2. The settings column already exists if you ran the original SQL.
+--    If not, add it:
+alter table rooms add column if not exists settings jsonb not null default '{}';
+`
+
 export default function Setup() {
   const nav = useNavigate()
   const [step, setStep] = useState(1)
   const [supaUrl, setSupaUrl] = useState('')
   const [supaKey, setSupaKey] = useState('')
   const [copied, setCopied] = useState(false)
+  const [copiedMigration, setCopiedMigration] = useState(false)
 
   function handleCopySQL() {
     copyText(SETUP_SQL)
     setCopied(true)
     toast('✅ SQL copied! Paste it in the Supabase SQL Editor', 'var(--accent)')
     setTimeout(() => setCopied(false), 3000)
+  }
+
+  function handleCopyMigration() {
+    copyText(MIGRATION_SQL)
+    setCopiedMigration(true)
+    toast('✅ Migration SQL copied!', 'var(--accent)')
+    setTimeout(() => setCopiedMigration(false), 3000)
   }
 
   function handleSaveEnv() {
@@ -137,6 +158,31 @@ VITE_SUPABASE_ANON_KEY=${supaKey.trim()}`
               <div>• <strong style={{ color: 'var(--text)' }}>room_events</strong> — real-time game events</div>
               <div>• Realtime subscriptions & public RLS policies</div>
             </div>
+          </div>
+
+          <hr className="divider" />
+
+          <div style={{
+            background: 'rgba(245,158,11,0.08)', border: '1px solid rgba(245,158,11,0.25)',
+            borderRadius: 'var(--radius-sm)', padding: 14, marginBottom: 14,
+          }}>
+            <div style={{ fontWeight: 800, color: 'var(--secondary)', marginBottom: 6 }}>
+              ⚡ Already have the DB set up? Run this migration instead
+            </div>
+            <p className="text-sm text-muted" style={{ marginBottom: 10 }}>
+              This fixes timer sync between devices and realtime reliability (required for the latest update).
+            </p>
+            <div style={{
+              background: 'var(--bg)', borderRadius: 'var(--radius-sm)',
+              border: '1px solid var(--border)', padding: 12, marginBottom: 10,
+              fontFamily: 'monospace', fontSize: '0.7rem', color: 'var(--text-secondary)',
+              lineHeight: 1.7, whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+            }}>
+              {MIGRATION_SQL.trim()}
+            </div>
+            <button className="btn btn-secondary btn-sm btn-full" onClick={handleCopyMigration}>
+              {copiedMigration ? '✅ Copied!' : '📋 Copy Migration SQL'}
+            </button>
           </div>
 
           <button className="btn btn-primary btn-full" onClick={() => setStep(3)}>

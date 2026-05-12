@@ -93,12 +93,18 @@ alter publication supabase_realtime add table players;
 alter publication supabase_realtime add table round_answers;
 alter publication supabase_realtime add table room_events;
 
--- RLS Policies (allow anonymous access for the game)
+-- CRITICAL: Set REPLICA IDENTITY FULL so UPDATE events broadcast old+new row
+-- Without this, only INSERT events work reliably with Supabase Realtime
 alter table rooms enable row level security;
 alter table players enable row level security;
 alter table round_answers enable row level security;
 alter table room_events enable row level security;
 
+alter table round_answers replica identity full;
+alter table rooms replica identity full;
+alter table players replica identity full;
+
+-- RLS Policies (allow anonymous access for the game)
 create policy "Public rooms" on rooms for all using (true) with check (true);
 create policy "Public players" on players for all using (true) with check (true);
 create policy "Public answers" on round_answers for all using (true) with check (true);
