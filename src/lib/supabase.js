@@ -146,23 +146,28 @@ export async function updateRoom(roomId, updates) {
 
 // Join or re-join a player. Score is NOT reset here — use resetAllScores for that.
 export async function joinPlayer({ id, roomId, name, avatar, avatarColor, isHost }) {
-  // Check if player already exists in this room
+  // Check if this player already exists in this specific room
   const { data: existing } = await supabase
     .from('players')
     .select('id, score')
     .eq('id', id)
     .eq('room_id', roomId)
-    .single()
+    .maybeSingle()
 
   if (existing) {
-    // Re-joining: just update online status, keep score
+    // Already in this room — update profile + online status, preserve score
     const { error } = await supabase
       .from('players')
-      .update({ is_online: true, last_seen: new Date().toISOString(), name, avatar, avatar_color: avatarColor })
+      .update({ name, avatar, avatar_color: avatarColor, is_online: true, last_seen: new Date().toISOString() })
       .eq('id', id)
+      .eq('room_id', roomId)
     if (error) throw error
   } else {
-    // New player: insert with score 0
+    // Check if player ID exists in a DIFFERENT room (common when creating new room)
+    // In that case generate a fresh ID won't help — we just delete the old row
+    await supabase.from('players').delete().eq('id', id)
+
+    // Now insert fresh into this room with score 0
     const { error } = await supabase
       .from('players')
       .insert({
