@@ -35,9 +35,11 @@ export default function Room() {
   const [showMenu, setShowMenu]       = useState(false)
 
   // Refs — always-current values safe inside setInterval / async callbacks
-  const timerRef     = useRef(null)   // the countdown interval
-  const scoringRef   = useRef(false)  // prevents double-scoring
-  const submittedRef = useRef(false)  // prevents double-submit
+  const timerRef          = useRef(null)   // the countdown interval
+  const graceTimerRef      = useRef(null)   // host's post-timer scoring delay
+  const scoringRef         = useRef(false)  // prevents double-scoring
+  const submittedRef       = useRef(false)  // prevents double-submit
+  const graceScheduledRef  = useRef(false)  // prevents duplicate grace timers
   const pingRef      = useRef(null)
   const channelRef   = useRef(null)
   const meRef        = useRef(null)
@@ -82,6 +84,7 @@ export default function Room() {
   function cleanup() {
     clearInterval(timerRef.current)
     clearInterval(pingRef.current)
+    clearTimeout(graceTimerRef.current)
     if (channelRef.current) supabase?.removeChannel(channelRef.current)
   }
 
@@ -98,18 +101,19 @@ export default function Room() {
   }
 
   // ─── Server-synced timer ───────────────────────────────────────────────────
-  // All devices calculate remaining time from the SAME server timestamp.
-  // This guarantees every device shows identical countdowns regardless of
-  // when they loaded or local clock differences.
+  // All devices calculate remaining time from the SAME server timestamp stored in DB.
+  // This guarantees every device shows identical countdowns regardless of load time.
   function startServerTimer(r) {
     clearInterval(timerRef.current)
+    clearTimeout(graceTimerRef.current)
+    graceScheduledRef.current = false
 
     const startedAt = r.settings?.round_started_at
       ? new Date(r.settings.round_started_at).getTime()
       : new Date(r.updated_at).getTime()
 
     function tick() {
-      const elapsed  = Math.floor((Date.now() - startedAt) / 1000)
+      const elapsed   = Math.floor((Date.now() - startedAt) / 1000)
       const remaining = Math.max(0, ROUND_TIME - elapsed)
       setTimeLeft(remaining)
 
@@ -117,24 +121,41 @@ export default function Room() {
 
       if (remaining <= 0) {
         clearInterval(timerRef.current)
-        // Auto-submit for this player if they haven't yet
+
+        // Auto-submit this player's answers if not yet done
         if (!submittedRef.current) {
           doSubmit(answersRef.current, roomRef.current)
         }
-        // Host scores after a fixed 6-second grace window —
-        // enough time for all clients to auto-submit their answers.
-        // We use setTimeout directly here; NO realtime trigger, no polling,
-        // no player-count check. Simple and reliable.
-        if (meRef.current?.is_host && !scoringRef.current) {
-          setTimeout(() => {
-            if (!scoringRef.current) scoreRound(roomRef.current)
-          }, 6000)
-        }
+
+        // Host: schedule scoring once after grace period
+        scheduleGraceScoring()
       }
     }
 
     tick()
-    timerRef.current = setInterval(tick, 500) // 500ms for smoother display
+    timerRef.current = setInterval(tick, 500)
+  }
+
+  // Schedule the host's grace-period scoring — called from timer end AND manual submit
+  // graceScheduledRef ensures this only fires once per round
+  function scheduleGraceScoring() {
+    if (!meRef.current?.is_host) return
+    if (graceScheduledRef.current) return
+    if (scoringRef.current) return
+    graceScheduledRef.current = true
+    clearTimeout(graceTimerRef.current)
+    graceTimerRef.current = setTimeout(async () => {
+      if (scoringRef.current) return
+      // Always fetch fresh room from DB — never rely on stale ref
+      try {
+        const freshRoom = await getRoom(roomId)
+        if (freshRoom.status === 'playing') {
+          scoreRound(freshRoom)
+        }
+      } catch(e) {
+        console.error('Grace scoring fetch error', e)
+      }
+    }, 6000)
   }
 
   // ─── Load results from DB (called by all players) ─────────────────────────
@@ -239,10 +260,12 @@ export default function Room() {
     answersRef.current = { Name:'', Place:'', Animal:'', Thing:'' }
     setSubmitted(false);     submittedRef.current = false
     scoringRef.current = false
+    graceScheduledRef.current = false
     setCurrentResults([])
     setSubmittedCount(0)
     setProcessing(false)
     clearInterval(timerRef.current)
+    clearTimeout(graceTimerRef.current)
   }
 
   // ─── Submit ────────────────────────────────────────────────────────────────
@@ -264,6 +287,9 @@ export default function Room() {
         answers: currentAnswers,
       })
       setSubmittedCount(prev => prev + 1)
+
+      // If host submitted manually (before timer runs out), schedule grace scoring
+      scheduleGraceScoring()
     } catch(e) {
       console.error('Submit error', e)
       toast('Submit error: ' + e.message, 'var(--danger)')
@@ -271,12 +297,22 @@ export default function Room() {
   }
 
   // ─── Score round (host only, called once after grace period) ───────────────
-  async function scoreRound(r) {
+  async function scoreRound(passedRoom) {
     if (scoringRef.current) return
     scoringRef.current = true
     setProcessing(true)
 
     try {
+      // Always fetch a FRESH room from DB — never trust passed-in or ref data
+      // This ensures we have the correct round_number, letter_history, target_score
+      const r = await getRoom(roomId)
+      if (!r || r.status !== 'playing') {
+        // Room status changed (paused, already scored, etc.) — abort silently
+        scoringRef.current = false
+        setProcessing(false)
+        return
+      }
+
       const [allAnswers, pList] = await Promise.all([
         getRoomAnswers(roomId, r.round_number),
         getPlayers(roomId)
