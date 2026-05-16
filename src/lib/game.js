@@ -172,81 +172,114 @@ export const LS = {
   set: (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)) } catch {} },
 }
 
-// ─── Claude validation ────────────────────────────────────────────────────────
-export async function validateAnswers(letter, answers) {
+// ─── Claude batch validation ─────────────────────────────────────────────────
+// Validates ALL unique words across ALL players in ONE API call.
+// This guarantees consistency — the same word is never valid for one player
+// and invalid for another.
+//
+// allAnswers: array of player answer objects from DB
+// letter: the current round letter
+// Returns: Map of "category:word_lowercase" → true/false
+export async function validateAllAnswers(letter, allAnswers) {
+  const ltr = letter.toUpperCase()
+
+  // Collect unique non-empty words per category across all players
+  const wordSets = { Name: new Set(), Place: new Set(), Animal: new Set(), Thing: new Set() }
+  for (const a of allAnswers) {
+    const map = { Name: a.name_answer, Place: a.place_answer, Animal: a.animal_answer, Thing: a.thing_answer }
+    for (const cat of CATEGORIES) {
+      const w = (map[cat] || '').trim()
+      if (w.length >= 2) wordSets[cat].add(w)
+    }
+  }
+
+  // Build flat list of unique words to validate
+  const toValidate = []
+  for (const cat of CATEGORIES) {
+    for (const w of wordSets[cat]) {
+      toValidate.push({ cat, word: w })
+    }
+  }
+
+  // Result map: "Cat:word_lower" → boolean
+  const resultMap = {}
+
+  // Pre-fill with false for all
+  toValidate.forEach(({ cat, word }) => {
+    // Immediate false if doesn't start with letter
+    if (word[0].toUpperCase() !== ltr) {
+      resultMap[`${cat}:${word.toLowerCase()}`] = false
+    }
+  })
+
+  const needsValidation = toValidate.filter(({ cat, word }) =>
+    resultMap[`${cat}:${word.toLowerCase()}`] === undefined
+  )
+
+  if (needsValidation.length === 0) return resultMap
+
+  // Build a single prompt listing all unique words
+  const wordList = needsValidation.map(({ cat, word }, i) =>
+    `${i + 1}. [${cat}] "${word}"`
+  ).join('\n')
+
+  const prompt = `You are a fair judge for the word game "Name, Place, Animal, Thing". Letter: "${ltr}"
+
+Validate each word below. Return a JSON array of true/false in the SAME ORDER as the list.
+
+RULES:
+- Must start with "${ltr}" (case-insensitive)
+- NAME: real human first name or surname from ANY country/culture (Chethana, Carlos, Chen → all valid)
+- PLACE: real geographic location — country, city, state, river, mountain, landmark (China, Chennai, Cairo → valid; made-up places like "Estopia" → false)
+- ANIMAL: real animal species or common name (Cat, Cobra, Crab → valid)
+- THING: must be a PHYSICAL, TANGIBLE object you can touch (Chair, Cup, Coin → valid). REJECT abstract words, concepts, emotions, actions (Courage, Chaos, End, Energy → all false)
+- Be generous for Names, Places, Animals. Be strict only for Things.
+
+Words to validate:
+${wordList}
+
+Respond ONLY with a JSON array of true/false values matching the order above. Example: [true, false, true]`
+
   try {
-    const filled = CATEGORIES.filter(c => (answers[c] || '').trim())
-    if (!filled.length) return { Name: false, Place: false, Animal: false, Thing: false }
-
-    const ltr = letter.toUpperCase()
-    const prompt = `You are a STRICT judge for the word game "Name, Place, Animal, Thing". Be tough — when in doubt, mark false.
-
-The letter is: "${ltr}"
-Answers submitted:
-  Name  = "${answers.Name  || ''}"
-  Place = "${answers.Place || ''}"
-  Animal= "${answers.Animal|| ''}"
-  Thing = "${answers.Thing || ''}"
-
-RULES — apply ALL of these:
-
-1. STARTS WITH LETTER: The answer must start with "${ltr}" (case-insensitive). If it does not, mark false immediately.
-
-2. NAME — must be a real, widely-known human first name OR surname (e.g. Alice, Gandhi, Obama).
-   ❌ REJECT: made-up names, place names used as names, common nouns, abstract words.
-
-3. PLACE — must be a real, verifiable geographic location: country, capital city, major city, well-known state/province, famous landmark (e.g. Egypt, Edinburgh, Eiffel Tower).
-   ❌ REJECT: made-up places (e.g. "Estopia", "Erewhon"), fictional locations, vague words, common nouns.
-
-4. ANIMAL — must be a real animal species or well-known common name (e.g. Elephant, Eel, Eagle).
-   ❌ REJECT: fictional creatures, general words, food items that are also animals unless clearly an animal name.
-
-5. THING — must be a TANGIBLE, PHYSICAL object that you can touch and hold or see in the real world (e.g. Eraser, Engine, Envelope).
-   ❌ REJECT: abstract concepts (e.g. "End", "Emotion", "Energy"), feelings, ideas, actions, verbs used as nouns, intangible things.
-
-6. MINIMUM LENGTH: Any answer under 2 characters = false.
-
-7. NOT GIBBERISH: Must be a real English word or proper noun, not random letters.
-
-Examples of correct judgments:
-  Letter E: Name="Eesha"→true, Place="Estopia"→FALSE (not real), Animal="Eel"→true, Thing="End"→FALSE (abstract)
-  Letter G: Name="Gandhi"→true, Place="Germany"→true, Animal="Gorilla"→true, Thing="Goods"→true
-  Letter A: Name="Alice"→true, Place="Austria"→true, Animal="Ant"→true, Thing="Ambition"→FALSE (abstract)
-
-Respond ONLY with a JSON object, no explanation, no markdown:
-{"Name":true/false,"Place":true/false,"Animal":true/false,"Thing":true/false}`
-
     const res = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         model: 'claude-sonnet-4-20250514',
-        max_tokens: 100,
+        max_tokens: 200,
         messages: [{ role: 'user', content: prompt }]
       })
     })
     const data = await res.json()
-    const text = (data.content?.[0]?.text || '{}').replace(/```json|```/g, '').trim()
-    const result = JSON.parse(text)
+    const text = (data.content?.[0]?.text || '[]').replace(/```json|```/g, '').trim()
+    const results = JSON.parse(text)
 
-    // Extra safety: if answer is empty, always false regardless of model response
-    for (const cat of CATEGORIES) {
-      if (!(answers[cat] || '').trim()) result[cat] = false
-      // Double-check letter starts with (model sometimes hallucinates)
-      const w = (answers[cat] || '').trim()
-      if (w && w[0].toUpperCase() !== ltr) result[cat] = false
-    }
-    return result
+    needsValidation.forEach(({ cat, word }, i) => {
+      resultMap[`${cat}:${word.toLowerCase()}`] = !!results[i]
+    })
+  } catch(e) {
+    console.error('Batch validation error', e)
+    // Fallback: simple starts-with check
+    needsValidation.forEach(({ cat, word }) => {
+      resultMap[`${cat}:${word.toLowerCase()}`] = word[0].toUpperCase() === ltr
+    })
+  }
 
-  } catch (e) {
-    console.error('Validation error', e)
-    // Fallback: simple starts-with + min length check only
-    const ltr = letter.toUpperCase()
-    const result = {}
-    for (const cat of CATEGORIES) {
-      const w = (answers[cat] || '').trim()
-      result[cat] = w.length >= 2 && w[0].toUpperCase() === ltr
-    }
-    return result
+  return resultMap
+}
+
+// Legacy single-answer validator (kept for compatibility, uses batch internally)
+export async function validateAnswers(letter, answers) {
+  const resultMap = await validateAllAnswers(letter, [{
+    name_answer: answers.Name || '',
+    place_answer: answers.Place || '',
+    animal_answer: answers.Animal || '',
+    thing_answer: answers.Thing || '',
+  }])
+  return {
+    Name:   resultMap[`Name:${(answers.Name||'').trim().toLowerCase()}`]   ?? false,
+    Place:  resultMap[`Place:${(answers.Place||'').trim().toLowerCase()}`]  ?? false,
+    Animal: resultMap[`Animal:${(answers.Animal||'').trim().toLowerCase()}`] ?? false,
+    Thing:  resultMap[`Thing:${(answers.Thing||'').trim().toLowerCase()}`]  ?? false,
   }
 }

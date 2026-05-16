@@ -7,7 +7,7 @@ import {
 } from '../lib/supabase.js'
 import {
   ROUND_TIME, getRandomLetter, calculateRoundPoints,
-  buildLetterHistoryEntry, validateAnswers, Audio, spawnConfetti,
+  buildLetterHistoryEntry, validateAllAnswers, Audio, spawnConfetti,
   toast, LS
 } from '../lib/game.js'
 import Lobby from '../components/Lobby.jsx'
@@ -318,12 +318,20 @@ export default function Room() {
         getPlayers(roomId)
       ])
 
-      // Validate every player's answers via Claude AI
-      const validated = await Promise.all(allAnswers.map(async a => {
-        const raw = { Name:a.name_answer, Place:a.place_answer, Animal:a.animal_answer, Thing:a.thing_answer }
-        const v = await validateAnswers(r.current_letter, raw)
-        return { ...a, name_valid:v.Name, place_valid:v.Place, animal_valid:v.Animal, thing_valid:v.Thing }
-      }))
+      // Validate ALL players' answers in ONE batch Claude call.
+      // Using a single call guarantees the same word always gets the same
+      // valid/invalid result across all players — no inconsistency.
+      const validationMap = await validateAllAnswers(r.current_letter, allAnswers)
+
+      const validated = allAnswers.map(a => {
+        const catMap = { Name: a.name_answer, Place: a.place_answer, Animal: a.animal_answer, Thing: a.thing_answer }
+        const valid = {}
+        for (const cat of ['Name','Place','Animal','Thing']) {
+          const w = (catMap[cat] || '').trim().toLowerCase()
+          valid[cat] = w ? (validationMap[`${cat}:${w}`] ?? false) : false
+        }
+        return { ...a, name_valid: valid.Name, place_valid: valid.Place, animal_valid: valid.Animal, thing_valid: valid.Thing }
+      })
 
       const scored = calculateRoundPoints(validated, r.current_letter, r.letter_history || [])
 
