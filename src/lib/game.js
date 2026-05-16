@@ -178,20 +178,42 @@ export async function validateAnswers(letter, answers) {
     const filled = CATEGORIES.filter(c => (answers[c] || '').trim())
     if (!filled.length) return { Name: false, Place: false, Animal: false, Thing: false }
 
-    const prompt = `You are a strict word validator for the game "Name, Place, Animal, Thing".
-Letter: "${letter.toUpperCase()}"
-Answers: Name="${answers.Name||''}", Place="${answers.Place||''}", Animal="${answers.Animal||''}", Thing="${answers.Thing||''}"
+    const ltr = letter.toUpperCase()
+    const prompt = `You are a STRICT judge for the word game "Name, Place, Animal, Thing". Be tough — when in doubt, mark false.
 
-Rules:
-- The word must start with the given letter (case-insensitive)
-- It must be a REAL, VALID word/name (not gibberish)
-- Empty strings = false
-- Names: real human first names or surnames
-- Places: real cities, countries, states, regions, landmarks
-- Animals: real animal species or common names
-- Things: any real physical object or concept
+The letter is: "${ltr}"
+Answers submitted:
+  Name  = "${answers.Name  || ''}"
+  Place = "${answers.Place || ''}"
+  Animal= "${answers.Animal|| ''}"
+  Thing = "${answers.Thing || ''}"
 
-Respond ONLY with valid JSON, no markdown:
+RULES — apply ALL of these:
+
+1. STARTS WITH LETTER: The answer must start with "${ltr}" (case-insensitive). If it does not, mark false immediately.
+
+2. NAME — must be a real, widely-known human first name OR surname (e.g. Alice, Gandhi, Obama).
+   ❌ REJECT: made-up names, place names used as names, common nouns, abstract words.
+
+3. PLACE — must be a real, verifiable geographic location: country, capital city, major city, well-known state/province, famous landmark (e.g. Egypt, Edinburgh, Eiffel Tower).
+   ❌ REJECT: made-up places (e.g. "Estopia", "Erewhon"), fictional locations, vague words, common nouns.
+
+4. ANIMAL — must be a real animal species or well-known common name (e.g. Elephant, Eel, Eagle).
+   ❌ REJECT: fictional creatures, general words, food items that are also animals unless clearly an animal name.
+
+5. THING — must be a TANGIBLE, PHYSICAL object that you can touch and hold or see in the real world (e.g. Eraser, Engine, Envelope).
+   ❌ REJECT: abstract concepts (e.g. "End", "Emotion", "Energy"), feelings, ideas, actions, verbs used as nouns, intangible things.
+
+6. MINIMUM LENGTH: Any answer under 2 characters = false.
+
+7. NOT GIBBERISH: Must be a real English word or proper noun, not random letters.
+
+Examples of correct judgments:
+  Letter E: Name="Eesha"→true, Place="Estopia"→FALSE (not real), Animal="Eel"→true, Thing="End"→FALSE (abstract)
+  Letter G: Name="Gandhi"→true, Place="Germany"→true, Animal="Gorilla"→true, Thing="Goods"→true
+  Letter A: Name="Alice"→true, Place="Austria"→true, Animal="Ant"→true, Thing="Ambition"→FALSE (abstract)
+
+Respond ONLY with a JSON object, no explanation, no markdown:
 {"Name":true/false,"Place":true/false,"Animal":true/false,"Thing":true/false}`
 
     const res = await fetch('https://api.anthropic.com/v1/messages', {
@@ -199,15 +221,26 @@ Respond ONLY with valid JSON, no markdown:
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         model: 'claude-sonnet-4-20250514',
-        max_tokens: 80,
+        max_tokens: 100,
         messages: [{ role: 'user', content: prompt }]
       })
     })
     const data = await res.json()
     const text = (data.content?.[0]?.text || '{}').replace(/```json|```/g, '').trim()
-    return JSON.parse(text)
-  } catch {
-    // Fallback: simple starts-with check
+    const result = JSON.parse(text)
+
+    // Extra safety: if answer is empty, always false regardless of model response
+    for (const cat of CATEGORIES) {
+      if (!(answers[cat] || '').trim()) result[cat] = false
+      // Double-check letter starts with (model sometimes hallucinates)
+      const w = (answers[cat] || '').trim()
+      if (w && w[0].toUpperCase() !== ltr) result[cat] = false
+    }
+    return result
+
+  } catch (e) {
+    console.error('Validation error', e)
+    // Fallback: simple starts-with + min length check only
     const ltr = letter.toUpperCase()
     const result = {}
     for (const cat of CATEGORIES) {
